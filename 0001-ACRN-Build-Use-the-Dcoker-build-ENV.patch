@@ -1,0 +1,163 @@
+From 63aad34b9b3334a8a70c216afa72680668afcfe3 Mon Sep 17 00:00:00 2001
+From: Liu Long <long.liu@linux.intel.com>
+Date: Mon, 27 Sep 2021 09:49:29 +0800
+Subject: [PATCH] ACRN: Build: Use the Dcoker build ENV
+
+Signed-off-by: Liu Long <long.liu@linux.intel.com>
+---
+ .makerc                |  1 +
+ Makefile               | 30 ++++++++++++++++++++-
+ misc/docker/Dockerfile | 61 ++++++++++++++++++++++++++++++++++++++++++
+ misc/docker/make.sh    |  9 +++++++
+ 4 files changed, 100 insertions(+), 1 deletion(-)
+ create mode 100644 .makerc
+ create mode 100644 misc/docker/Dockerfile
+ create mode 100755 misc/docker/make.sh
+
+diff --git a/.makerc b/.makerc
+new file mode 100644
+index 000000000..5936747c0
+--- /dev/null
++++ b/.makerc
+@@ -0,0 +1 @@
++USE_DOCKER=y
+diff --git a/Makefile b/Makefile
+index 6866fc478..6a86b72f8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -19,6 +19,28 @@ ifdef KCONFIG_FILE
+   $(error To specify the target board and scenario, define BOARD/SCENARIO variables on the command line)
+ endif
+ 
++#Use the .dockerenv to check if in Docker
++DOCKER_ENV := /.dockerenv
++ifeq ("$(wildcard $(DOCKER_ENV))","")
++  # Use the .makerc to switch if use Acrn Docker build enviroment
++  ifneq ($(findstring USE_DOCKER=y,$(strip $(shell cat .makerc))),)
++  ifndef DOCKERFILE
++    # Use the default Dockerfile
++    DOCKERFILE := misc/docker/Dockerfile
++  endif
++  DOCKERFILE_ID := $(shell git log --pretty=format:"%h" Makefile | head -1  | awk '{print $1}')
++  DOCKER_IMAGE_NAME := acrn:$(MAJOR_VERSION)_$(MINOR_VERSION)_$(DOCKERFILE_ID)
++  DOCKER_BUILD_IMAGE := docker build -t "$(DOCKER_IMAGE_NAME)" -f "$(DOCKERFILE)" .
++  DOCKER_RUN := docker run -it --rm -v $(T):/Workspace/ \
++	    --user 1000:1000 \
++	    $(DOCKER_IMAGE_NAME) \
++	    make $(MAKEFLAGS) $(MAKECMDGOALS) $(MAKEOVERRIDES)
++  endif
++.PHONY: Docker
++Docker:
++	$(DOCKER_BUILD_IMAGE); $(DOCKER_RUN)
++else
++
+ # BOARD/SCENARIO/BOARD_FILE/SCENARIO_FILE parameters sanity check:
+ #
+ # Only below usages are VALID: (target = all | hypervisor)
+@@ -47,7 +69,12 @@ ifneq ($(BOARD_FILE)$(SCENARIO_FILE),)
+ 
+   override BOARD := $(realpath $(BOARD_FILE))
+   override SCENARIO := $(realpath $(SCENARIO_FILE))
+-else
++  ifeq ($(DOCKER),1)
++    override BOARD := /Workspace/$(BOARD_FILE)
++    override SCENARIO := /Workspace/$(SCENARIO_FILE)
++  endif
++endif
++
+   # BOARD/SCENARIO pointing to XML files must be converted to absolute paths before being passed to hypervisor/Makefile
+   # because paths relative to acrn-hypervisor/ are typically invalid when relative to acrn-hypervisor/Makefile
+   ifneq ($(realpath $(BOARD)),)
+@@ -98,6 +125,7 @@ define install_acrn_debug
+ 	$(MAKE) -C $(T)/hypervisor HV_OBJDIR=$(HV_OUT)/$(1) BOARD=$(1) SCENARIO=$(2) RELEASE=$(RELEASE) install-debug
+ endef
+ 
++
+ HV_MAKEOPTS := -C $(T)/hypervisor BOARD=$(BOARD) SCENARIO=$(SCENARIO) HV_OBJDIR=$(HV_OUT) RELEASE=$(RELEASE)
+ 
+ hypervisor: hvdefconfig
+diff --git a/misc/docker/Dockerfile b/misc/docker/Dockerfile
+new file mode 100644
+index 000000000..532323a3a
+--- /dev/null
++++ b/misc/docker/Dockerfile
+@@ -0,0 +1,61 @@
++# syntax=docker/dockerfile1.2
++
++ARG UBUNTU_VERSION=20.04
++ARG UBUNTU_IMAGE="ubuntu:${UBUNTU_VERSION}"
++
++# Build container based on Ubuntu 18.04
++FROM ${UBUNTU_IMAGE} AS base
++RUN echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
++ARG ATP_MIIOR
++RUN echo 'Acquire::http::proxy "http://child-prc.intel.com:913/";' > /etc/apt/apt.conf.d/proxy.conf
++RUN echo 'Acquire::https::proxy "http://child-prc.intel.com:913/";' >> /etc/apt/apt.conf.d/proxy.conf
++RUN echo 'Acquire::ftp::proxy "ftp://child-prc.intel.com:913/";' >> /etc/apt/apt.conf.d/proxy.conf 
++RUN echo 'Acquire::socks::proxy "socks://child-prc.intel.com:913/";' >> /etc/apt/apt.conf.d/proxy.conf
++ENV http_proxy=http://child-prc.intel.com:913
++ENV https_proxy=http://child-prc.intel.com:913
++ENV DEBIAN_FRONTEND=noninteractive
++
++FROM base AS ACRN
++
++WORKDIR /Workspace
++# Install dependencies.
++RUN apt-get update \
++    && apt-get install -y gcc make vim git \
++                          gnu-efi \
++                          libssl-dev \
++                          libpciaccess-dev \
++                          uuid-dev \
++                          libsystemd-dev \
++                          libevent-dev \
++                          libxml2-dev \
++                          libusb-1.0-0-dev \
++			  python3 \
++			  python3-pip \
++			  libblkid-dev \
++			  e2fslibs-dev \
++			  pkg-config \
++			  libnuma-dev \
++			  liblz4-tool \
++			  flex \
++			  bison \
++			  xsltproc \
++			  clang-format \
++			  wget \
++			  supervisor \
++			  libxml2-utils \
++			  && apt-get clean
++
++RUN pip3 install kconfiglib --proxy=http://child-prc.intel.com:913 \
++    && pip3 install lxml --proxy=http://child-prc.intel.com:913 \
++    && wget https://acpica.org/sites/acpica/files/acpica-unix-20210105.tar.gz \
++    && tar zxvf acpica-unix-20210105.tar.gz \
++    && cd acpica-unix-20210105 \
++    && make clean \
++    && make iasl \
++    && cp ./generate/unix/bin/iasl /usr/sbin/
++
++COPY misc/config_tools/config_app/requirements .
++RUN pip3 install -r requirements --proxy=http://child-prc.intel.com:913
++
++EXPOSE 5001/udp
++EXPOSE 5001/tcp
+diff --git a/misc/docker/make.sh b/misc/docker/make.sh
+new file mode 100755
+index 000000000..39f6d30cd
+--- /dev/null
++++ b/misc/docker/make.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++set -e
++set -o pipefail
++echo
++main() {
++	make $@ 
++}
++
++main "$@"
+-- 
+2.25.1
+
